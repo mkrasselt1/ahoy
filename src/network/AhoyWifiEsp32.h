@@ -9,6 +9,7 @@
 #if defined(ESP32)
 #include <functional>
 #include <AsyncUDP.h>
+#include <WiFi.h>
 #include "AhoyNetwork.h"
 #include "ESPAsyncWebServer.h"
 
@@ -29,6 +30,9 @@ class AhoyWifi : public AhoyNetwork {
                 setStaticIp();
                 WiFi.begin(mConfig->sys.stationSsid, mConfig->sys.stationPwd, WIFI_ALL_CHANNEL_SCAN);
                 mWifiConnecting = true;
+                mLastConnectAttemptMs = millis();
+                if(0 == mOutageStartMs)
+                    mOutageStartMs = mLastConnectAttemptMs;
 
                 DBGPRINT(F("connect to network '"));
                 DBGPRINT(mConfig->sys.stationSsid);
@@ -40,6 +44,25 @@ class AhoyWifi : public AhoyNetwork {
             AhoyNetwork::tickNetworkLoop();
             if(mAp.isEnabled())
                 mAp.tickLoop();
+
+            if(mStatus != NetworkState::GOT_IP) {
+                const uint32_t now = millis();
+
+                if(0 == mOutageStartMs)
+                    mOutageStartMs = now;
+
+                if(mRetryScheduled && ((now - mLastConnectAttemptMs) >= WIFI_RETRY_INTERVAL_MS)) {
+                    mRetryScheduled = false;
+                    triggerReconnect();
+                }
+
+                if(!mLongRecoveryDone && ((now - mOutageStartMs) >= WIFI_LONG_RECOVERY_MS)) {
+                    mLongRecoveryDone = true;
+                    DPRINTLN(DBG_WARN, F("Network long outage, force WiFi reconnect"));
+                    WiFi.disconnect(true, false);
+                    triggerReconnect();
+                }
+            }
         }
 
         virtual String getIp(void) override {
@@ -63,6 +86,10 @@ class AhoyWifi : public AhoyNetwork {
 
                 case SYSTEM_EVENT_STA_GOT_IP:
                     mStatus = NetworkState::GOT_IP;
+                    mRetryCount = 0;
+                    mRetryScheduled = false;
+                    mLongRecoveryDone = false;
+                    mOutageStartMs = 0;
                     if(mAp.isEnabled())
                         mAp.disable();
 
@@ -84,8 +111,8 @@ class AhoyWifi : public AhoyNetwork {
                         mConnected = false;
                         mOnNetworkCB(false);
                         MDNS.end();
-                        begin();
                     }
+                    scheduleReconnect();
                     break;
 
                 default:
@@ -98,6 +125,46 @@ class AhoyWifi : public AhoyNetwork {
                 return WiFi.config(ip, gateway, mask, dns1, dns2);
             });
         }
+
+        void scheduleReconnect() {
+            if(mRetryScheduled)
+                return;
+
+            mRetryScheduled = true;
+            if(0 == mOutageStartMs)
+                mOutageStartMs = millis();
+        }
+
+        void triggerReconnect() {
+            if(strlen(mConfig->sys.stationSsid) == 0)
+                return;
+
+            ++mRetryCount;
+
+            DBGPRINT(F("Network reconnect try #"));
+            DBGPRINT(mRetryCount);
+            DBGPRINTLN(F(""));
+
+            WiFi.disconnect(false, false);
+            setStaticIp();
+            WiFi.begin(mConfig->sys.stationSsid, mConfig->sys.stationPwd, WIFI_ALL_CHANNEL_SCAN);
+            mWifiConnecting = true;
+            mLastConnectAttemptMs = millis();
+
+            if(mRetryCount >= WIFI_AP_FALLBACK_RETRIES)
+                mAp.enable();
+        }
+
+    private:
+        static constexpr uint8_t WIFI_AP_FALLBACK_RETRIES = 4;
+        static constexpr uint32_t WIFI_RETRY_INTERVAL_MS = 15000;
+        static constexpr uint32_t WIFI_LONG_RECOVERY_MS = 30UL * 60UL * 1000UL;
+
+        uint32_t mLastConnectAttemptMs = 0;
+        uint32_t mOutageStartMs = 0;
+        uint8_t mRetryCount = 0;
+        bool mRetryScheduled = false;
+        bool mLongRecoveryDone = false;
 };
 
 #endif /*ESP32*/
